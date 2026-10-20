@@ -30,11 +30,13 @@ Config.TimeDayColor   = '~COLOR_WHITE~'
 Config.TimeNightColor = '~COLOR_BLUEDARK~'
 
 Config.ShowTemperature       = true
+Config.TemperatureUnit       = 'celsius' -- 'celsius', 'fahrenheit' or 'auto' (follows the player's game metric setting)
 Config.TemperatureColdDegree = 15  -- celsius; below this uses the cold colour
 Config.TemperatureHotColor   = '~COLOR_YELLOWSTRONG~'
 Config.TemperatureColdColor  = '~COLOR_BLUE~'
 
 Config.ShowWind  = true
+Config.SpeedUnit = 'mph' -- 'mph', 'kmh' or 'auto' (follows the player's game metric setting)
 Config.WindColor = '~COLOR_RADAR_CENTER_BLIP~'
 
 ---------------------------------

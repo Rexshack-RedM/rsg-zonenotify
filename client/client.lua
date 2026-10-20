@@ -387,7 +387,10 @@ end
 
 local function GetBottomText(c)
     local parts = {}
-    local metric = ShouldUseMetricTemperature()
+    local gameMetric = ShouldUseMetricTemperature()
+    local tempUnit, speedUnit = Config.TemperatureUnit or 'auto', Config.SpeedUnit or 'auto'
+    local celsius = tempUnit == 'celsius' or (tempUnit ~= 'fahrenheit' and gameMetric)
+    local kmh = speedUnit == 'kmh' or (speedUnit ~= 'mph' and gameMetric)
 
     if Config.ShowTime then
         local h, m = GetClockHours(), GetClockMinutes()
@@ -398,12 +401,12 @@ local function GetBottomText(c)
     if Config.ShowTemperature then
         local t = GetTemperatureAtCoords(c.x, c.y, c.z)
         local col = t < Config.TemperatureColdDegree and Config.TemperatureColdColor or Config.TemperatureHotColor
-        parts[#parts + 1] = col .. (metric and locale('cl_temp_c', math.ceil(t)) or locale('cl_temp_f', math.ceil(t * 9 / 5 + 32)))
+        parts[#parts + 1] = col .. (celsius and locale('cl_temp_c', math.ceil(t)) or locale('cl_temp_f', math.ceil(t * 9 / 5 + 32)))
     end
 
     if Config.ShowWind then
         local w = GetWindSpeed()
-        parts[#parts + 1] = Config.WindColor .. (metric and locale('cl_wind_kph', math.floor(w)) or locale('cl_wind_mph', math.floor(w * 0.621371)))
+        parts[#parts + 1] = Config.WindColor .. (kmh and locale('cl_wind_kph', math.floor(w)) or locale('cl_wind_mph', math.floor(w * 0.621371)))
     end
 
     return table.concat(parts, ' ~COLOR_WHITE~| ')
