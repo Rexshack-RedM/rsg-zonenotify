@@ -3,8 +3,8 @@ rdr3_warning 'I acknowledge that this is a prerelease build of RedM, and I am aw
 game 'rdr3'
 lua54 'yes'
 
-description 'rsg-zonenotify - native location banner when entering states, districts and towns'
-version '3.0.0'
+description 'rsg-zonenotify - location banner when entering states, districts and towns'
+version '3.1.0'
 
 shared_scripts {
     '@ox_lib/init.lua',
@@ -20,8 +20,13 @@ server_scripts {
     'server/versionchecker.lua',
 }
 
+ui_page 'html/index.html'
+
 files {
     'locales/*.json',
+    'html/index.html',
+    'html/style.css',
+    'html/script.js',
 }
 
 dependencies {

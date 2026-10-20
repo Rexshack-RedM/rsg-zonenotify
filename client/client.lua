@@ -1,5 +1,5 @@
 -- rsg-zonenotify
--- Shows the native RDR2 location banner when you enter a new state, district or town.
+-- Shows a location banner (custom NUI or native RDR2) when you enter a new state, district or town.
 -- Zone data ported from VORPCORE/vorp_zonenotify (credits: freedy69 / Bytesized).
 lib.locale()
 
@@ -280,8 +280,16 @@ local PRONGHORN_HASH <const> = -120578354
 ----------------------------------------------------------------
 -- helpers
 ----------------------------------------------------------------
+-- normalise to signed 32-bit so it always matches the table keys
+local function Signed(h)
+    h = (h or 0) & 0xFFFFFFFF
+    if h >= 0x80000000 then h = h - 0x100000000 end
+    return h
+end
+
 local function ZoneAt(c, zoneType)
-    return GetMapZoneAtCoords(c.x, c.y, c.z, zoneType)
+    -- _GET_MAP_ZONE_AT_COORDS
+    return Signed(Citizen.InvokeNative(0x43AD8FC02B429D33, c.x, c.y, c.z, zoneType, Citizen.ResultAsInteger()))
 end
 
 local function GetBigInt(value)
@@ -291,19 +299,83 @@ local function GetBigInt(value)
 end
 
 local function FeedBusy()
-    return UiFeedGetCurrentMessage(2) ~= 0
+    -- UI_FEED_GET_CURRENT_MESSAGE
+    return Citizen.InvokeNative(0xC17F69E1418CD11F, 2, Citizen.ResultAsInteger()) ~= 0
 end
 
-local function ShowLocationUi(bottomText, topText)
-    local str1 = CreateVarString(10, 'LITERAL_STRING', topText)
+-- turn a game label key (e.g. 'district_heartlands') into its display text
+local PREFIXES <const> = { 'DISTRICT_', 'STATE_', 'TOWN_', 'WATER_', 'LANDMARK_', 'HIDEOUT_', 'SETTLEMENT_', 'HOMESTEAD_' }
+local SMALL_WORDS <const> = { OF = true, THE = true, DE = true, LA = true, DEL = true, AND = true }
+
+-- 'district_cumberland_forest' -> 'Cumberland Forest'
+local function Prettify(key)
+    local s = key:upper()
+    for _, p in ipairs(PREFIXES) do
+        if s:sub(1, #p) == p then s = s:sub(#p + 1) break end
+    end
+    local words, i = {}, 0
+    for w in s:gmatch('[^_]+') do
+        i = i + 1
+        if i > 1 and SMALL_WORDS[w] then
+            words[#words + 1] = w:lower()
+        else
+            words[#words + 1] = w:sub(1, 1) .. w:sub(2):lower()
+        end
+    end
+    return table.concat(words, ' ')
+end
+
+local function IsGoodLabel(txt, key)
+    return txt and txt ~= '' and txt ~= 'NULL' and txt:upper() ~= key:upper() and not txt:find('_')
+end
+
+-- turn a game label key (e.g. 'district_heartlands') into its display text
+local function Label(key)
+    if Config.LabelNames and Config.LabelNames[key] then return Config.LabelNames[key] end
+    for _, k in ipairs({ key, key:upper() }) do
+        local ok, txt = pcall(GetLabelText, k)
+        if ok and IsGoodLabel(txt, key) then return txt end
+    end
+    return Prettify(key)
+end
+
+local function StripCodes(text)
+    return (text:gsub('~[%w_]+~', ''))
+end
+
+local function ShowLocationUi(bottomText, topText, mode)
+    local title = Label(topText)
+    mode = mode or Config.DisplayMode
+
+    if mode == 'nui' then
+        -- split "~COLOR_X~text ~COLOR_WHITE~| ~COLOR_Y~text" into coloured parts
+        local parts = {}
+        for seg in (bottomText .. ' ~COLOR_WHITE~| '):gmatch('(.-) ~COLOR_WHITE~| ') do
+            local code, txt = seg:match('^~([%w_]+)~(.*)$')
+            txt = StripCodes(txt or seg)
+            if txt ~= '' then
+                parts[#parts + 1] = { text = txt, color = code and Config.NuiColors[code] or nil }
+            end
+        end
+        SendNUIMessage({ action = 'show', title = title, parts = parts, duration = Config.DisplayTime })
+        return
+    end
+
+    if mode == 'notify' then
+        lib.notify({ title = title, description = StripCodes(bottomText), type = 'inform', duration = Config.DisplayTime })
+        return
+    end
+
+    local str1 = CreateVarString(10, 'LITERAL_STRING', title)
     local str2 = CreateVarString(10, 'LITERAL_STRING', bottomText)
     local struct1 = DataView.ArrayBuffer(8 * 7)
     local struct2 = DataView.ArrayBuffer(8 * 5)
-    struct1:SetInt32(0, Config.DisplayTime)
+    struct1:SetInt32(8 * 0, Config.DisplayTime)
     struct2:SetInt64(8 * 1, GetBigInt(str1))
     struct2:SetInt64(8 * 2, GetBigInt(str2))
-    -- _UI_FEED_POST_LOCATION_SHARD
-    Citizen.InvokeNative(0xD05590C1AB38F068, struct1:Buffer(), struct2:Buffer(), 0, 1)
+    -- _UI_FEED_POST_LOCATION_SHARD(duration*, data*, p2, p3)
+    local id = Citizen.InvokeNative(0xD05590C1AB38F068, struct1:Buffer(), struct2:Buffer(), 0, 1, Citizen.ResultAsInteger())
+    if Config.Debug then print(('[rsg-zonenotify] shard posted id=%s title=%s'):format(tostring(id), title)) end
 end
 
 local function FormatTime(h, m)
@@ -409,20 +481,46 @@ local function ResetStored(c)
     pending = nil
 end
 
+local function MakePending(text, zoneType, hash)
+    return { text = text, zoneType = zoneType, hash = hash, since = GetGameTimer() }
+end
+
+-- best banner for where the player is now (town > district > state), skipping unmapped zones
+local function BestBannerFor(state, district, town, townChanged, districtChanged, stateChanged)
+    if townChanged and town ~= 0 and Config.Notify.Town and TOWNS[town] then
+        return MakePending(TOWNS[town], ZONE.TOWN, town)
+    end
+    -- leaving a town counts as re-entering the surrounding district
+    if (districtChanged or townChanged) and district ~= 0 and Config.Notify.District and DISTRICTS[district] then
+        return MakePending(DISTRICTS[district], ZONE.DISTRICT, district)
+    end
+    if (stateChanged or districtChanged or townChanged) and state ~= 0 and Config.Notify.State and STATES[state] then
+        -- only fall back to the state when the state really changed, or the district is unmapped
+        if stateChanged or not DISTRICTS[district] then
+            return MakePending(STATES[state], ZONE.STATE, state)
+        end
+    end
+    return nil
+end
+
 local function CheckZones(c)
     local state    = ZoneAt(c, ZONE.STATE)
     local district = ZoneAt(c, ZONE.DISTRICT)
     local town     = ZoneAt(c, ZONE.TOWN)
 
-    -- pick the most specific change this tick (town > district > state)
-    local newPending
-    if town ~= stored.town and town ~= 0 and Config.Notify.Town and TOWNS[town] then
-        newPending = { text = TOWNS[town], zoneType = ZONE.TOWN, hash = town }
-    elseif district ~= stored.district and district ~= 0 and Config.Notify.District and DISTRICTS[district] then
-        newPending = { text = DISTRICTS[district], zoneType = ZONE.DISTRICT, hash = district }
-    elseif state ~= stored.state and state ~= 0 and Config.Notify.State and STATES[state] then
-        newPending = { text = STATES[state], zoneType = ZONE.STATE, hash = state }
+    local townChanged     = town ~= stored.town
+    local districtChanged = district ~= stored.district
+    local stateChanged    = state ~= stored.state
+
+    if Config.Debug and (townChanged or districtChanged or stateChanged) then
+        print(('[rsg-zonenotify] state=%s district=%s town=%s'):format(state, district, town))
     end
+
+    -- leaving a town, or crossing into an unmapped area, only matters when we land somewhere mapped
+    local onlyLeftTown = townChanged and town == 0 and not districtChanged and not stateChanged
+    if onlyLeftTown and not Config.Notify.LeaveTown then townChanged = false end
+
+    local newPending = BestBannerFor(state, district, town, townChanged, districtChanged, stateChanged)
 
     stored.state, stored.district, stored.town = state, district, town
     if newPending then pending = newPending end
@@ -435,23 +533,34 @@ local function CheckZones(c)
         return
     end
 
-    if CanShowBanner() and not FeedBusy() then
-        ShowLocationUi(GetBottomText(c), pending.text)
-        pending = nil
+    if not CanShowBanner() then
+        if Config.Debug then print('[rsg-zonenotify] banner held: faded/paused/dead/disabled') end
+        return
     end
+
+    -- wait for the feed to be free, but never forever (other feed messages / tooltips can hold it)
+    if Config.DisplayMode == 'native' and FeedBusy() and GetGameTimer() - pending.since < Config.MaxFeedWait then return end
+
+    local moving = Config.DisplayMode == 'native' and GetEntitySpeed(cache.ped) > Config.MovingSpeed
+    if moving and Config.WhileMoving == 'wait' then return end -- hold until the player slows down
+
+    if Config.Debug then print('[rsg-zonenotify] showing ' .. pending.text) end
+    local text = pending.text
+    pending = nil
+    ShowLocationUi(GetBottomText(c), text, (moving and Config.WhileMoving == 'notify') and 'notify' or nil)
 end
 
 ----------------------------------------------------------------
 -- manual "where am I"
 ----------------------------------------------------------------
 local function ShowCurrentLocation()
-    if not isLoggedIn then return end
+    if not isLoggedIn or IsPauseMenuActive() or IsScreenFadedOut() or IsEntityDead(cache.ped) then return end
 
     local now = GetGameTimer()
     if now - lastManual < Config.ManualCooldown then return end
     lastManual = now
 
-    if FeedBusy() then return end
+    if Config.DisplayMode == 'native' and FeedBusy() then return end
 
     local ped = cache.ped
     local interior = GetInteriorFromEntity(ped)
@@ -476,9 +585,15 @@ end
 CreateThread(function()
     while true do
         if isLoggedIn then
-            CheckZones(GetEntityCoords(cache.ped))
+            local ok, err = pcall(CheckZones, GetEntityCoords(cache.ped))
+            if not ok then
+                pending = nil
+                print('^1[rsg-zonenotify] error: ' .. tostring(err) .. '^7')
+            end
+            Wait(Config.CheckInterval)
+        else
+            Wait(1000)
         end
-        Wait(Config.CheckInterval)
     end
 end)
 
@@ -507,7 +622,7 @@ if Config.ToggleCommand then
     RegisterCommand(Config.ToggleCommand, function()
         enabled = not enabled
         SetResourceKvpInt(KVP_KEY, enabled and 1 or 2)
-        if not enabled then pending = nil end
+        if not enabled then pending = nil; SendNUIMessage({ action = 'hide' }) end
         lib.notify({ title = locale('cl_title'), description = locale(enabled and 'cl_enabled' or 'cl_disabled'), type = 'inform' })
     end, false)
     TriggerEvent('chat:addSuggestion', '/' .. Config.ToggleCommand, locale('cl_cmd_toggle'))
@@ -517,15 +632,21 @@ end
 -- player state
 ----------------------------------------------------------------
 local function OnLoaded()
+    if Config.Debug then print('[rsg-zonenotify] player loaded, zone checks running') end
     ResetStored(GetEntityCoords(cache.ped)) -- no banner on spawn
     isLoggedIn = true
 end
 
 RegisterNetEvent('RSGCore:Client:OnPlayerLoaded', OnLoaded)
 
+local function HideBanner()
+    if Config.DisplayMode == 'nui' then SendNUIMessage({ action = 'hide' }) end
+end
+
 RegisterNetEvent('RSGCore:Client:OnPlayerUnload', function()
     isLoggedIn = false
     pending = nil
+    HideBanner()
 end)
 
 AddEventHandler('onResourceStart', function(res)
@@ -537,5 +658,15 @@ AddEventHandler('onResourceStop', function(res)
     if Config.Command then TriggerEvent('chat:removeSuggestion', '/' .. Config.Command) end
     if Config.ToggleCommand then TriggerEvent('chat:removeSuggestion', '/' .. Config.ToggleCommand) end
 end)
+
+if Config.Debug then -- test command: /zonetest [delay seconds]
+    RegisterCommand('zonetest', function(_, args)
+        local delay = tonumber(args[1]) or 0
+        if delay > 0 then print(('[rsg-zonenotify] banner in %ds - start riding'):format(delay)) end
+        SetTimeout(delay * 1000, function()
+            ShowLocationUi(GetBottomText(GetEntityCoords(cache.ped)), 'district_heartlands')
+        end)
+    end, false)
+end
 
 exports('ShowCurrentLocation', ShowCurrentLocation)
